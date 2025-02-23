@@ -3,7 +3,7 @@ import gzip
 import json
 import pickle
 import pandas as pd
-import numpy
+import numpy as np
 
 from sklearn.compose import ColumnTransformer
 from sklearn.model_selection import GridSearchCV
@@ -15,15 +15,11 @@ from sklearn.metrics import precision_score, balanced_accuracy_score, recall_sco
 
 # Función para preparar y limpiar los datos
 def preprocess_dataframe(df: pd.DataFrame):
-    # Se realiza una copia para no modificar el original
     df_clean = df.copy()
-    # Renombrar la columna de salida y eliminar la columna 'ID'
     df_clean = df_clean.rename(columns={"default payment next month": "default"})
     df_clean.drop(columns=["ID"], inplace=True)
-    # Eliminar registros con datos faltantes y filtrar registros con valores válidos
     df_clean.dropna(inplace=True)
     df_clean = df_clean[(df_clean["EDUCATION"] != 0) & (df_clean["MARRIAGE"] != 0)]
-    # Agrupar valores de EDUCATION mayores o iguales a 4 en la categoría "others"
     df_clean["EDUCATION"] = df_clean["EDUCATION"].apply(lambda v: 4 if v >= 4 else v).astype("category")
     X = df_clean.drop(columns=["default"])
     y = df_clean["default"]
@@ -32,31 +28,35 @@ def preprocess_dataframe(df: pd.DataFrame):
 # Creación del pipeline de procesamiento y modelo
 def build_model_pipeline() -> Pipeline:
     categorical_features = ["SEX", "EDUCATION", "MARRIAGE"]
-    # Se transforma las variables categóricas y se escala el resto de variables
     transformer = ColumnTransformer(
         transformers=[
             ("cat_enc", OneHotEncoder(), categorical_features)
         ],
         remainder=MinMaxScaler()
     )
-    # Se construye el pipeline con preprocesamiento, selección de características y modelo de regresión logística
     pipe = Pipeline([
         ("transformer", transformer),
-        ("selector", SelectKBest(score_func=f_regression, k=10)),
+        ("selector", SelectKBest(score_func=f_regression)),  # k se optimiza posteriormente
         ("clf", LogisticRegression(max_iter=1000, random_state=42))
     ])
     return pipe
 
-# Función para la optimización de hiperparámetros mediante GridSearchCV
+# Optimización de hiperparámetros con GridSearchCV, ampliando el rango de C
 def tune_hyperparameters(pipeline_obj, features, target):
-    params = {
-        "selector__k": range(1, 11),
-        "clf__C": [0.1, 1, 10, 100],
+    # Ajustar el preprocesador para conocer la dimensión final de las características
+    transformer = pipeline_obj.named_steps["transformer"]
+    X_trans = transformer.fit_transform(features)
+    num_features = X_trans.shape[1]
+    
+    param_grid = {
+        "selector__k": range(1, num_features + 1),
+        "clf__C": [0.1, 1, 10, 100, 1000],
         "clf__solver": ["liblinear", "lbfgs"]
     }
+    
     grid_cv = GridSearchCV(
         estimator=pipeline_obj,
-        param_grid=params,
+        param_grid=param_grid,
         cv=10,
         scoring="balanced_accuracy",
         n_jobs=-1,
@@ -72,10 +72,28 @@ def persist_model(model_obj):
     with gzip.open("files/models/model.pkl.gz", "wb") as out_file:
         pickle.dump(model_obj, out_file)
 
-# Cálculo de las métricas de evaluación
-def calculate_metrics(model_obj, X_train, y_train, X_test, y_test):
-    pred_train = model_obj.predict(X_train)
-    pred_test = model_obj.predict(X_test)
+# Función para determinar el mejor umbral basándose en balanced_accuracy
+def choose_best_threshold(model, X, y):
+    proba = model.predict_proba(X)[:, 1]
+    best_threshold = 0.5
+    best_score = 0
+    for t in np.linspace(0, 1, 101):
+        preds = (proba >= t).astype(int)
+        score = balanced_accuracy_score(y, preds)
+        if score > best_score:
+            best_score = score
+            best_threshold = t
+    return best_threshold
+
+# Función de predicción personalizada usando un umbral determinado
+def custom_predict(model, X, threshold):
+    proba = model.predict_proba(X)[:, 1]
+    return (proba >= threshold).astype(int)
+
+# Cálculo de métricas utilizando la predicción con umbral personalizado
+def calculate_metrics(model_obj, X_train, y_train, X_test, y_test, threshold):
+    pred_train = custom_predict(model_obj, X_train, threshold)
+    pred_test = custom_predict(model_obj, X_test, threshold)
     
     metrics_train = {
         "type": "metrics",
@@ -96,10 +114,10 @@ def calculate_metrics(model_obj, X_train, y_train, X_test, y_test):
     }
     return metrics_train, metrics_test
 
-# Generación de la matriz de confusión para train y test
-def compute_confusion_matrix(model_obj, X_train, y_train, X_test, y_test):
-    pred_train = model_obj.predict(X_train)
-    pred_test = model_obj.predict(X_test)
+# Cálculo de la matriz de confusión usando las predicciones con umbral personalizado
+def compute_confusion_matrix(model_obj, X_train, y_train, X_test, y_test, threshold):
+    pred_train = custom_predict(model_obj, X_train, threshold)
+    pred_test = custom_predict(model_obj, X_test, threshold)
     
     cm_train = confusion_matrix(y_train, pred_train)
     cm_test = confusion_matrix(y_test, pred_test)
@@ -122,7 +140,6 @@ def compute_confusion_matrix(model_obj, X_train, y_train, X_test, y_test):
 
 # Escritura de los resultados en un archivo JSON
 def write_metrics_to_file(train_metrics, test_metrics, cm_train, cm_test, filepath="files/output/metrics.json"):
-    # Asegurarse de que el directorio existe
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     results = [train_metrics, test_metrics, cm_train, cm_test]
     with open(filepath, "w") as f:
@@ -131,22 +148,21 @@ def write_metrics_to_file(train_metrics, test_metrics, cm_train, cm_test, filepa
 
 # --- Flujo principal del script ---
 
-# Lectura de los datasets comprimidos
 data_test = pd.read_csv("files/input/test_data.csv.zip", compression="zip")
 data_train = pd.read_csv("files/input/train_data.csv.zip", compression="zip")
 
-# Preprocesamiento de datos
 data_test, X_test, y_test = preprocess_dataframe(data_test)
 data_train, X_train, y_train = preprocess_dataframe(data_train)
 
-# Construcción del pipeline y optimización
 model_pipe = build_model_pipeline()
 best_model = tune_hyperparameters(model_pipe, X_train, y_train)
 persist_model(best_model)
 
-# Cálculo de métricas y matrices de confusión
-metrics_train, metrics_test = calculate_metrics(best_model, X_train, y_train, X_test, y_test)
-conf_train, conf_test = compute_confusion_matrix(best_model, X_train, y_train, X_test, y_test)
+# Calcular el umbral óptimo en el conjunto de entrenamiento
+threshold = choose_best_threshold(best_model, X_train, y_train)
+
+metrics_train, metrics_test = calculate_metrics(best_model, X_train, y_train, X_test, y_test, threshold)
+conf_train, conf_test = compute_confusion_matrix(best_model, X_train, y_train, X_test, y_test, threshold)
 write_metrics_to_file(metrics_train, metrics_test, conf_train, conf_test)
 
 # flake8: noqa: E501

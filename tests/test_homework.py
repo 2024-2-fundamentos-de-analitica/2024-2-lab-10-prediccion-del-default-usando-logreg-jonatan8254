@@ -5,7 +5,6 @@ import gzip
 import json
 import os
 import pickle
-import numpy
 
 import pandas as pd  # type: ignore
 
@@ -42,7 +41,7 @@ METRICS = [
         "type": "cm_matrix",
         "dataset": "train",
         "true_0": {"predicted_0": 15560, "predicted_1": None},
-        "true_1": {"predicted_0": None, "predicted_1": 1508},
+        "true_1": {"predicted_0": None, "predicted_1": 1444},
     },
     {
         "type": "cm_matrix",
