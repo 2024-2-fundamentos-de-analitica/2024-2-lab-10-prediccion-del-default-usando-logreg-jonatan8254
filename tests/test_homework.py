@@ -5,6 +5,7 @@ import gzip
 import json
 import os
 import pickle
+import numpy
 
 import pandas as pd  # type: ignore
 
